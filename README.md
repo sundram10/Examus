@@ -1,14 +1,14 @@
-# ProctorLess
+# EXAMUS
 *Changing the way teachers take examinations* 
 
 ## Team Name
 **TensorGANs** 
 
 ## Team Members
-- Aarushi Dua
-- Aaryan Arora 
-- Abhisht Dixit
-- Rishit Toteja 
+- 
+- SUNDRAM JHA 
+- RITISH SHARMA
+- GAUTAM GOYAL 
 
 ## Introduction
 With the onset of COVID-19, students and teachers across the globe were forced to shift to online teaching. The lectures started being held over google meet or a zoom call, however, none of these software had a solution for proctoring online examinations. Human proctors were not able to check each student carefully, and thus it led to massive cheating and copying in online exams.
