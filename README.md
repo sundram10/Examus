@@ -5,10 +5,10 @@
 **TensorGANs** 
 
 ## Team Members
-- 
 - SUNDRAM JHA 
 - RITISH SHARMA
 - GAUTAM GOYAL 
+- DHRUV DUDEJA
 
 ## Introduction
 With the onset of COVID-19, students and teachers across the globe were forced to shift to online teaching. The lectures started being held over google meet or a zoom call, however, none of these software had a solution for proctoring online examinations. Human proctors were not able to check each student carefully, and thus it led to massive cheating and copying in online exams.
@@ -91,14 +91,6 @@ Apart from removing the burden from the shoulders of teachers, proctoring would 
 5. An easy to use end to end solution can be setup for universities and testing agencies.
 
 ## Screenshots:
-![alt text](/Screenshots/eyes_detection.jpg)
-![alt text](/Screenshots/mouth_detection.jpg)
-![alt text](/Screenshots/Cell%20phone.png)
-![alt text](/Screenshots/headphone2.JPG)
-![alt text](/Screenshots/headphone3.JPG)
-![alt text](/Screenshots/person.JPG)
-![alt text](/Screenshots/person2.png)
-![alt text](/Screenshots/person3.JPG)
 ![alt text](/Screenshots/Similarity%20checker.png)
 ![alt text](/Screenshots/Speech%20Recognition.png)
 
