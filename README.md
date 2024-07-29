@@ -1,14 +1,9 @@
 # EXAMUS
-*Changing the way teachers take examinations* 
+Purpose: EXAMUS aims to create a secure exam environment by reducing the chances of student malicious activities during remote proctored examinations.
+Modules: The project consists of various modules including Object Detection, Person Count, Face Recognition, and Eye Detection.
+Implementation: These modules are implemented using technologies like YOLO V4, OpenCV, and JavaScript helper functions in the Google Colab environment.
 
-## Team Name
-**TensorGANs** 
 
-## Team Members
-- SUNDRAM JHA 
-- RITISH SHARMA
-- GAUTAM GOYAL 
-- DHRUV DUDEJA
 
 ## Introduction
 With the onset of COVID-19, students and teachers across the globe were forced to shift to online teaching. The lectures started being held over google meet or a zoom call, however, none of these software had a solution for proctoring online examinations. Human proctors were not able to check each student carefully, and thus it led to massive cheating and copying in online exams.
