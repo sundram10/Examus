@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+generate_mock_data.py
+
+Generates robust mock datasets (with many edge cases) for:
+ - mock_account_product.csv    (500 rows)
+ - mock_facility_credit.csv    (500 rows)
+ - mock_facility_mapped.csv    (500 rows)
+ - mock_facility_fulfilled.csv (500 rows)
+ - mock_facility_purpose.csv   (500 rows)
+
+These CSVs include fields used by the matching algorithm: SORT_CODE, ACCOUNT_NAME,
+interest_rate, repayment_amount, maturity_date, product ids, etc., plus many
+edge cases (fuzzy IDs, truncated IDs, duplicates, missing values).
+
+Run:
+    python generate_mock_data.py
+"""
+
+import random
+import string
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import os
+
+random.seed(42)
+np.random.seed(42)
+
+OUT_DIR = "."
+N = 500
+
+def rand(prefix="", n=8):
+    return prefix + ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+def random_date(start_year=2015, end_year=2024):
+    start = datetime(start_year,1,1)
+    end = datetime(end_year,12,31)
+    return (start + timedelta(days=random.randint(0, (end-start).days))).strftime("%Y-%m-%d")
+
+def noisy_id(base):
+    # small noise (typos, truncation)
+    r = random.random()
+    if r < 0.12:
+        return base[:-1] + random.choice(["X","Z"])
+    if r < 0.22:
+        return base[:-2] + random.choice(["99","AA"])
+    if r < 0.32:
+        return base[:len(base)//2]
+    return base
+
+# PRODUCTS / DOMAINS
+PRODUCT_IDS = ["PID98","PID102","PID203","PID524"]
+PRODUCT_GROUPS = {"PID98":"PG9","PID102":"PG9","PID203":"PG4","PID524":"PG4"}
+SOURCE_CODES = ["RCB","CAP","VNP","CMN","ACS","TSY","MIP","DLI","CMF","AMC"]
+SECTORS = ["MS SME Banking","MS Wholesale","UNKNOWN"]
+
+# -----------------------
+# ACCOUNT PRODUCT (N rows)
+# -----------------------
+accounts = []
+for i in range(N):
+    acc_num = rand("ACC",10)
+    unique_id = rand("UNQ",12)
+    acct_name = random.choice(["Acme Ltd","Beta Co","Gamma PLC","Omega Enterprises", "John & Sons"]) + " " + str(random.randint(1,100))
+    sort_code = "{}-{}-{}".format(str(random.randint(0,99)).zfill(2), str(random.randint(0,99)).zfill(2), str(random.randint(0,99)).zfill(2))
+    bolt_pid = random.choice(PRODUCT_IDS)
+    product_group = PRODUCT_GROUPS[bolt_pid]
+    acc_limit = round(random.uniform(0,250000),2)
+    acc_balance = round(random.uniform(-2000,200000),2)
+    interest_rate = round(random.uniform(0.5,12.0), 2) if random.random() < 0.6 else None
+    repayment_amount = round(random.uniform(50,5000),2) if random.random() < 0.5 else None
+    maturity_date = random_date(2024,2035) if random.random() < 0.4 else None
+
+    # edge-case flags
+    alt_acc = rand("ALT",8) if random.random() < 0.08 else None
+    fuzzy_variant = noisy_id(acc_num) if random.random() < 0.25 else None
+    missing_some = True if random.random() < 0.05 else False
+
+    accounts.append({
+        "TRANSACTION_ID": 100000 + i,
+        "CUSTOMERMAPPINGKEY": f"CUST{random.randint(1000,9999)}",
+        "SYSTEMTABLEID": random.choice([280,55,99]),
+        "ENTITYID": random.choice([None, random.randint(100,999)]),
+        "SOURCE_CUSTOMERMAPPINGKEY": f"SRC{random.randint(10,999)}" if random.random()<0.8 else None,
+        "SOURCE_SYSTEMTABLEID": random.choice([280,55,99]),
+        "SOURCE_ENTITYID": random.choice([None,501,502]),
+        "ACCOUNT_OPEN_DATE": random_date(2015,2021),
+        "ACCOUNT_CLOSE_DATE": random_date(2022,2024) if random.random() < 0.08 else None,
+        "ACCOUNT_BALANCE": acc_balance,
+        "ACCOUNT_LIMIT": acc_limit,
+        "SOURCE_CODE": random.choice(SOURCE_CODES),
+        "SOURCE_TABLE": random.choice(["COGT_CAC_CUSTACCOUNT_VNP_STG","COGT_LOA_ACCOUNT_ACS_STG"]),
+        "SOURCE_ROW_ID": rand("RID",8),
+        "ALTERNATIVE_ACCOUNT_NUMBER": alt_acc,
+        "ACCOUNT_NUMBER": acc_num,
+        "FUZZY_ID_VARIANT": fuzzy_variant,
+        "SORT_CODE": sort_code,
+        "ACCOUNT_NAME": acct_name,
+        "STATUS": random.choice(["A","C"]),
+        "CURR_CDE": random.choice(["GBP","USD","EUR"]),
+        "TTC_PRODUCT_TYPE": random.choice(["01","02","03"]),
+        "PARENT_TXN_ID": random.choice([None, random.randint(10000,99999)]),
+        "HERITAGE": random.choice(["LLOYDS","BOS","HBOS"]),
+        "HCE_PRODUCT_CODE": random.choice(["HCE1","HCE2","HCE3"]),
+        "HCE_PRODUCT_DESC": random.choice(["Loan","Card","Overdraft"]),
+        "CONSECUTIVE_DAYS_IN_EXCESS": random.randint(0,120),
+        "CURRENT_MONTH_DAYS_IN_EXCESS": random.randint(0,60),
+        "PREVIOUS_MONTH_DAYS_IN_EXCESS": random.randint(0,60),
+        "LOAN_REPAYMENT_CODE": random.choice(["A","B","C", None]),
+        "LOAN_MATURITY_DATE": maturity_date,
+        "DATE_ENDED": None,
+        "ECFM_DATE_ENDED": None,
+        "BOLT_PRODUCTID": bolt_pid,
+        "BOLT_PRODUCTGROUPID": product_group,
+        "BOLT_PRODUCTNAME": random.choice(["Business Loan","Credit Card"]),
+        "BOLT_PRODUCTTYPE": random.choice(["TypeA","TypeB"]),
+        "DATE_OF_LAST_CREDIT": random_date(2017,2023),
+        "UNIQUE_ACCOUNT_IDENTIFIER": unique_id,
+        "SOE_CREATED_DATETIME": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SOE_UPDATED_DATETIME": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "LOADDATE": datetime.now().strftime("%Y-%m-%d"),
+        "LIMIT_EXPIRY_DATE": random_date(2025,2029) if random.random()<0.25 else None,
+        "LIMIT_TYPE": random.choice(["Single","StepDown", None]),
+        "INTEREST_RATE": interest_rate,
+        "REPAYMENT_AMOUNT": repayment_amount,
+        "MATURITY_DATE": maturity_date,
+        "SECTOR": random.choice(SECTORS)
+    })
+
+df_accounts = pd.DataFrame(accounts)
+df_accounts.to_csv(os.path.join(OUT_DIR, "mock_account_product.csv"), index=False)
+
+# -----------------------
+# CREDIT FACILITY (N rows) - main facility table
+# -----------------------
+facilities = []
+for i in range(N):
+    facilityId = 2000 + i
+    facilityInstanceId = 5000 + i
+    productId = random.choice(PRODUCT_IDS)
+    productGroupId = PRODUCT_GROUPS[productId]
+    requested = round(random.uniform(1000,200000),2)
+    existing = round(requested * random.uniform(0.0,1.0),2)
+    facility_stage = random.choice(["WIP","Sanctioned","Fulfilled"])
+    # include some missing fields intentionally
+    customerId = random.randint(1000,9999) if random.random() < 0.9 else None
+    interest_rate = round(random.uniform(0.5,12.0),2) if random.random() < 0.6 else None
+    repayment_amount = round(random.uniform(50,5000),2) if random.random() < 0.5 else None
+    maturity_date = random_date(2024,2035) if random.random() < 0.4 else None
+
+    facilities.append({
+        "facilityId": facilityId,
+        "facilityInstanceId": facilityInstanceId,
+        "customerId": customerId,
+        "proposalId": rand("CASE",6),
+        "typeOfCommitment": random.choice(["hard","soft","internal"]),
+        "productGroupId": productGroupId,
+        "productName": random.choice(["Business Loan","Card Product","Overdraft"]),
+        "productId": productId,
+        "facilityStage": facility_stage,
+        "requestedFacilityLimit": requested,
+        "existingSanctionedLimit": existing,
+        "createdDate": random_date(2015,2021),
+        "updatedDate": random_date(2022,2024),
+        "interest_rate": interest_rate,
+        "repayment_amount": repayment_amount,
+        "maturity_date": maturity_date
+    })
+
+df_fac = pd.DataFrame(facilities)
+df_fac.to_csv(os.path.join(OUT_DIR, "mock_facility_credit.csv"), index=False)
+
+# -----------------------
+# MAPPED FACILITY (external ids)
+# -----------------------
+mapped = []
+for i in range(N):
+    finst = 5000 + i
+    # pick a random account sometimes to generate exact/fuzzy matches
+    acct_row = df_accounts.sample(1).iloc[0]
+    r = random.random()
+    if r < 0.3:
+        facilityId_external = acct_row["ACCOUNT_NUMBER"]               # exact
+    elif r < 0.6:
+        facilityId_external = acct_row["FUZZY_ID_VARIANT"] or acct_row["ACCOUNT_NUMBER"][:-3]  # fuzzy
+    elif r < 0.85:
+        facilityId_external = rand("FEXT",10)                         # unrelated id
+    else:
+        facilityId_external = None                                    # missing external id
+    mapped.append({
+        "facilityInstanceId": finst,
+        "sourceSystemName": random.choice(["BOLT","RADS","VNP","CAP"]),
+        "facilityId": facilityId_external,
+        "createdDate": random_date(2016,2022),
+        "updatedDate": random_date(2022,2024)
+    })
+
+df_mapped = pd.DataFrame(mapped)
+df_mapped.to_csv(os.path.join(OUT_DIR, "mock_facility_mapped.csv"), index=False)
+
+# -----------------------
+# FULFILLED ACCOUNT mapping
+# -----------------------
+fulfilled = []
+for i in range(N):
+    finst = 5000 + i
+    acct_row = df_accounts.sample(1).iloc[0]
+    r = random.random()
+    if r < 0.35:
+        fulfilled_acc = acct_row["ACCOUNT_NUMBER"]           # exact
+    elif r < 0.65:
+        fulfilled_acc = acct_row["FUZZY_ID_VARIANT"] or acct_row["ACCOUNT_NUMBER"][:-2]
+    elif r < 0.9:
+        fulfilled_acc = rand("FUL",10)                      # unrelated
+    else:
+        fulfilled_acc = None                                # missing
+    fulfilled.append({
+        "facilityInstanceId": finst,
+        "fulfilledAccountId": fulfilled_acc,
+        "createdDate": random_date(2016,2022),
+        "updatedDate": random_date(2022,2024)
+    })
+
+df_ful = pd.DataFrame(fulfilled)
+df_ful.to_csv(os.path.join(OUT_DIR, "mock_facility_fulfilled.csv"), index=False)
+
+# -----------------------
+# FACILITY PURPOSE
+# -----------------------
+purposes = []
+for i in range(N):
+    finst = 5000 + i
+    purposes.append({
+        "facilityInstanceId": finst,
+        "purpose": random.choice(["Working Capital","Refinance","Purchase Equipment","Pay VAT Bill"])
+    })
+df_purp = pd.DataFrame(purposes)
+df_purp.to_csv(os.path.join(OUT_DIR, "mock_facility_purpose.csv"), index=False)
+
+print("Mock files created:")
+print(" - mock_account_product.csv")
+print(" - mock_facility_credit.csv")
+print(" - mock_facility_mapped.csv")
+print(" - mock_facility_fulfilled.csv")
+print(" - mock_facility_purpose.csv")
