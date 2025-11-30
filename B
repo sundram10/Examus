@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""
+beam_match_pipeline.py
+
+Apache Beam pipeline that:
+ - reads the mock CSVs (or BigQuery tables if you switch the IO),
+ - builds a facility_enriched view (merging credit, mapped, fulfilled, purpose),
+ - blocks candidates by (SORT_CODE, PRODUCT_GROUP, SOURCE_SYSTEM) to reduce comparisons,
+ - computes a weighted match score using:
+      - account number exact/fuzzy
+      - sort code exact
+      - source system exact
+      - product match
+      - limit similarity
+      - name fuzzy similarity (rapidfuzz)
+      - interest/repayment/maturity similarity
+ - chooses best candidate per account and emits explainability fields
+ - writes results to CSV (or BigQuery)
+
+Run locally:
+    python beam_match_pipeline.py --input_prefix=./mock_ --output_path=./match_results --runner=DirectRunner
+
+To run on Dataflow:
+    set --runner=DataflowRunner and the GCP pipeline options (project, region, temp_location).
+"""
+
+import argparse
+import csv
+import json
+from datetime import datetime
+from dateutil import parser as date_parser
+import re
+
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+from rapidfuzz import fuzz
+import pandas as pd
+
+# ----------------------------
+# Configurable weights & thresholds
+# ----------------------------
+WEIGHTS = {
+    "acctnum": 0.45,
+    "sort": 0.10,
+    "source": 0.05,
+    "product": 0.05,
+    "limit": 0.15,
+    "name": 0.10,
+    "irrm": 0.10
+}
+
+FUZZY_THRESHOLD = 0.85
+LIMIT_TOLERANCE_RATIO = 0.20
+
+# ----------------------------
+# Normalization & scoring utils
+# ----------------------------
+
+def normalize_id(s):
+    if s is None:
+        return None
+    s = str(s).strip()
+    s = re.sub(r'[^A-Za-z0-9]', '', s)
+    s = s.lstrip('0')
+    return s.upper()
+
+def normalize_name(name):
+    if not name:
+        return ""
+    s = str(name).lower()
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    stopwords = {'ltd','limited','co','company','plc','the','and','&'}
+    tokens = [t for t in s.split() if t not in stopwords]
+    return " ".join(tokens).strip()
+
+def name_similarity(a, b):
+    a_n = normalize_name(a)
+    b_n = normalize_name(b)
+    if not a_n or not b_n:
+        return 0.0
+    return fuzz.token_sort_ratio(a_n, b_n) / 100.0
+
+def limit_similarity(a, b):
+    try:
+        a = float(a); b = float(b)
+    except Exception:
+        return 0.0
+    if a == 0 and b == 0:
+        return 1.0
+    diff = abs(a - b)
+    denom = max(abs(a), abs(b), 1.0)
+    return max(0.0, 1.0 - diff/denom)
+
+def parse_date(s):
+    if s is None:
+        return None
+    try:
+        return date_parser.parse(str(s)).date()
+    except Exception:
+        return None
+
+def interest_repayment_maturity_similarity(acc, fac):
+    # average of available similarity measures (0..1)
+    s = 0.0
+    parts = 0
+    # interest
+    ar = acc.get("INTEREST_RATE") or acc.get("interest_rate")
+    fr = fac.get("interest_rate")
+    if ar is not None and fr is not None:
+        try:
+            ar = float(ar); fr = float(fr)
+            val = max(0.0, 1 - abs(ar-fr) / max(abs(ar), abs(fr), 0.0001))
+            s += val; parts += 1
+        except:
+            pass
+    # repayment amount
+    ar2 = acc.get("REPAYMENT_AMOUNT") or acc.get("repayment_amount")
+    fr2 = fac.get("repayment_amount")
+    if ar2 is not None and fr2 is not None:
+        try:
+            ar2 = float(ar2); fr2 = float(fr2)
+            val = max(0.0, 1 - abs(ar2-fr2) / max(abs(ar2), abs(fr2), 1.0))
+            s += val; parts += 1
+        except:
+            pass
+    # maturity date
+    adm = parse_date(acc.get("MATURITY_DATE") or acc.get("maturity_date"))
+    fdm = parse_date(fac.get("maturity_date"))
+    if adm and fdm:
+        days = abs((adm - fdm).days)
+        if days <= 30:
+            s += 1.0
+        else:
+            s += max(0.0, 1.0 - (days / 365.0))
+        parts += 1
+
+    if parts == 0:
+        return 0.0
+    return s / parts
+
+# ----------------------------
+# Build facility enriched view (merge 4 facility tables)
+# ----------------------------
+
+def build_facility_enriched(credit_rows, mapped_rows, fulfilled_rows, purpose_rows):
+    """
+    credit_rows, mapped_rows, fulfilled_rows, purpose_rows are list-of-dicts (from CSVs or BQ).
+    Returns facility_enriched list-of-dicts.
+    """
+    fac_map = {}
+    # credit (primary)
+    for r in credit_rows:
+        key = r.get("facilityInstanceId")
+        fac_map.setdefault(key, {}).update(r)
+
+    # mapped
+    for r in mapped_rows:
+        key = r.get("facilityInstanceId")
+        if key not in fac_map:
+            fac_map.setdefault(key, {})
+        fac_map[key].update({
+            "mappedFacilityId": r.get("facilityId"),
+            "sourceSystemName": r.get("sourceSystemName")
+        })
+
+    # fulfilled
+    for r in fulfilled_rows:
+        key = r.get("facilityInstanceId")
+        fac_map.setdefault(key, {})
+        fac_map[key].update({"fulfilledAccountId": r.get("fulfilledAccountId")})
+
+    # purpose
+    for r in purpose_rows:
+        key = r.get("facilityInstanceId")
+        fac_map.setdefault(key, {})
+        fac_map[key].update({"facilityPurpose": r.get("purpose")})
+
+    # normalize numeric fields types if present
+    enriched = []
+    for k,v in fac_map.items():
+        # ensure numeric fields exist
+        for field in ["requestedFacilityLimit","existingSanctionedLimit","interest_rate","repayment_amount"]:
+            if field in v and pd_isnan(v[field]):
+                v[field] = None
+        enriched.append(v)
+    return enriched
+
+def pd_isnan(x):
+    try:
+        import math
+        return x is None or (isinstance(x, float) and math.isnan(x))
+    except:
+        return False
+
+# ----------------------------
+# Scoring function (weighted)
+# ----------------------------
+
+def compute_match_score(account, facility, weights=WEIGHTS):
+    """
+    Returns (score 0..1, detail dict, reason string)
+    """
+    detail = {k:0.0 for k in weights.keys()}
+    # Normalize
+    acc_num = normalize_id(account.get("ACCOUNT_NUMBER"))
+    acc_unique = normalize_id(account.get("UNIQUE_ACCOUNT_IDENTIFIER"))
+    fac_ful = normalize_id(facility.get("fulfilledAccountId"))
+    fac_mapped = normalize_id(facility.get("mappedFacilityId"))
+
+    # short-circuit exact strong match
+    if acc_num and fac_ful and acc_num == fac_ful:
+        detail["acctnum"] = 1.0
+        return 1.0, detail, "SHORTCIRCUIT:ACCOUNT==FULFILLED"
+    if acc_unique and fac_ful and acc_unique == fac_ful:
+        detail["acctnum"] = 1.0
+        return 1.0, detail, "SHORTCIRCUIT:UNIQUE==FULFILLED"
+    if acc_num and fac_mapped and acc_num == fac_mapped:
+        detail["acctnum"] = 0.98
+        return 0.98, detail, "SHORTCIRCUIT:ACCOUNT==MAPPED"
+    if acc_unique and fac_mapped and acc_unique == fac_mapped:
+        detail["acctnum"] = 0.98
+        return 0.98, detail, "SHORTCIRCUIT:UNIQUE==MAPPED"
+
+    # acctnum fuzzy partial
+    acctnum_fuzzy = max(
+        (fuzz.partial_ratio(str(acc_num), str(fac_ful))/100.0) if acc_num and fac_ful else 0.0,
+        (fuzz.partial_ratio(str(acc_num), str(fac_mapped))/100.0) if acc_num and fac_mapped else 0.0
+    )
+    detail["acctnum"] = acctnum_fuzzy
+
+    # sort code exact
+    acc_sort = (account.get("SORT_CODE") or "").strip()
+    fac_sort = (facility.get("sortCode") or "").strip()
+    detail["sort"] = 1.0 if acc_sort and fac_sort and acc_sort == fac_sort else 0.0
+
+    # source system match
+    detail["source"] = 1.0 if account.get("SOURCE_CODE") and facility.get("sourceSystemName") \
+                      and account["SOURCE_CODE"] == facility["sourceSystemName"] else 0.0
+
+    # product match
+    detail["product"] = 1.0 if (account.get("BOLT_PRODUCTID") and facility.get("productId") \
+                       and account["BOLT_PRODUCTID"] == facility["productId"]) else 0.0
+
+    # limit similarity (existingSanctionedLimit used)
+    detail["limit"] = limit_similarity(account.get("ACCOUNT_LIMIT"), facility.get("existingSanctionedLimit") or facility.get("requestedFacilityLimit"))
+
+    # name similarity
+    detail["name"] = name_similarity(account.get("ACCOUNT_NAME"), facility.get("customerName") or facility.get("customer_name") or "")
+
+    # interest/repayment/maturity combined
+    detail["irrm"] = interest_repayment_maturity_similarity(account, facility)
+
+    # weighted sum
+    score = 0.0
+    for k,w in weights.items():
+        score += w * detail.get(k, 0.0)
+
+    # if fuzzy acctnum is very high, bump reason
+    reason = "WEIGHTED"
+    if acctnum_fuzzy >= FUZZY_THRESHOLD:
+        reason = "FUZZY_ACCTNUM"
+
+    return score, detail, reason
+
+# ----------------------------
+# Beam transforms
+# ----------------------------
+
+class ToKVByBlock(beam.DoFn):
+    """
+    Convert rows into key/value pairs keyed by block tuple:
+    (SORT_CODE, PRODUCT_GROUP, SOURCE_CODE)
+    If any of those are missing, use 'NULL' placeholder.
+    """
+    def __init__(self, account_side=True):
+        self.account_side = account_side
+
+    def process(self, row):
+        sort_code = (row.get("SORT_CODE") or row.get("sort_code") or "NULL")
+        product = (row.get("BOLT_PRODUCTGROUPID") or row.get("productGroupId") or "NULL")
+        source = (row.get("SOURCE_CODE") or row.get("sourceSystemName") or "NULL")
+        key = "{}|{}|{}".format(sort_code, product, source)
+        yield (key, row)
+
+class ScoreAndPick(beam.DoFn):
+    """
+    For each block (key), receive grouped accounts and facilities and compute best matches.
+    Input: (key, {"accounts": [...], "facilities":[...]})
+    Emits one match record per account.
+    """
+    def process(self, kv):
+        key, grouped = kv
+        accounts = grouped.get("accounts", [])
+        facilities = grouped.get("facilities", [])
+        # convert facilities list to enriched dicts (if not already)
+        for acct in accounts:
+            best = None
+            best_score = -1.0
+            best_detail = None
+            best_reason = None
+            # candidate selection: small optimization - only consider fac with same product or sort if abundant
+            for fac in facilities:
+                score, detail, reason = compute_match_score(acct, fac)
+                if score > best_score:
+                    best_score = score
+                    best = fac
+                    best_detail = detail
+                    best_reason = reason
+            category = categorize_score(best_score)
+            out = {
+                "TRANSACTION_ID": acct.get("TRANSACTION_ID"),
+                "ACCOUNT_NUMBER": acct.get("ACCOUNT_NUMBER"),
+                "UNIQUE_ACCOUNT_IDENTIFIER": acct.get("UNIQUE_ACCOUNT_IDENTIFIER"),
+                "SORT_CODE": acct.get("SORT_CODE"),
+                "BOLT_PRODUCTID": acct.get("BOLT_PRODUCTID"),
+                "ACCOUNT_LIMIT": acct.get("ACCOUNT_LIMIT"),
+                "MATCHED_FACILITY_INSTANCE_ID": best.get("facilityInstanceId") if best else None,
+                "MATCHED_FACILITY_ID": best.get("facilityId") if best else best.get("mappedFacilityId") if best and best.get("mappedFacilityId") else None,
+                "MATCH_SCORE": round(best_score, 4),
+                "MATCH_CATEGORY": category,
+                "MATCH_REASON": best_reason,
+                "FEATURE_SCORES": json.dumps(best_detail)
+            }
+            yield out
+
+def categorize_score(s):
+    if s >= 0.85:
+        return "EXACT/RESOLVED"
+    if s >= 0.70:
+        return "HIGH"
+    if s >= 0.50:
+        return "MEDIUM"
+    return "LOW/NO_MATCH"
+
+# ----------------------------
+# Pipeline runner (local-friendly; can be adapted for Dataflow)
+# ----------------------------
+
+def read_csv_as_list(path):
+    # uses pandas for robust parsing
+    df = pd.read_csv(path, dtype=str).replace({pd.NA: None})
+    # convert numeric fields back if present
+    return df.to_dict(orient="records")
+
+def run(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_prefix", default="./mock_", help="prefix for mock CSV files (default ./mock_)")
+    parser.add_argument("--output_path", default="./match_results", help="output path prefix for matches")
+    parser.add_argument("--runner", default="DirectRunner", help="DirectRunner or DataflowRunner")
+    args, pipeline_args = parser.parse_known_args(argv)
+
+    # local CSV file names
+    acc_csv = args.input_prefix + "account_product.csv"      # e.g. ./mock_account_product.csv
+    fac_credit_csv = args.input_prefix + "facility_credit.csv"
+    fac_mapped_csv = args.input_prefix + "facility_mapped.csv"
+    fac_fulfilled_csv = args.input_prefix + "facility_fulfilled.csv"
+    fac_purpose_csv = args.input_prefix + "facility_purpose.csv"
+
+    # NOTE: the default generator names in earlier script are different; adapt if needed.
+    # If you used the generator above, filenames are:
+    #   mock_account_product.csv
+    #   mock_facility_credit.csv
+    #   mock_facility_mapped.csv
+    #   mock_facility_fulfilled.csv
+    #   mock_facility_purpose.csv
+    # Adjust prefix accordingly or rename files.
+    # For safety, try both name patterns:
+    def pick_file(a,b):
+        import os
+        return a if os.path.exists(a) else b
+
+    acc_csv = pick_file(acc_csv, "./mock_account_product.csv")
+    fac_credit_csv = pick_file(fac_credit_csv, "./mock_facility_credit.csv")
+    fac_mapped_csv = pick_file(fac_mapped_csv, "./mock_facility_mapped.csv")
+    fac_fulfilled_csv = pick_file(fac_fulfilled_csv, "./mock_facility_fulfilled.csv")
+    fac_purpose_csv = pick_file(fac_purpose_csv, "./mock_facility_purpose.csv")
+
+    # read CSVs to python lists (small datasets). For production BigQuery, replace this block with ReadFromBigQuery transforms.
+    accounts_list = read_csv_as_list(acc_csv)
+    credit_list = read_csv_as_list(fac_credit_csv)
+    mapped_list = read_csv_as_list(fac_mapped_csv)
+    fulfilled_list = read_csv_as_list(fac_fulfilled_csv)
+    purpose_list = read_csv_as_list(fac_purpose_csv)
+
+    # Build facility enriched view (merge)
+    enriched_facilities = build_facility_enriched(credit_list, mapped_list, fulfilled_list, purpose_list)
+
+    # Optional: normalize facility field names for matching convenience
+    for f in enriched_facilities:
+        # ensure keys exist
+        f.setdefault("facilityInstanceId", f.get("facilityInstanceId"))
+        f.setdefault("facilityId", f.get("facilityId"))
+        # normalize numeric types if strings
+        for numf in ["requestedFacilityLimit","existingSanctionedLimit","interest_rate","repayment_amount"]:
+            if numf in f and isinstance(f[numf], str) and f[numf] != '':
+                try:
+                    f[numf] = float(f[numf])
+                except:
+                    pass
+
+    # Beam pipeline
+    pipeline_options = PipelineOptions(pipeline_args)
+    pipeline_options.view_as(beam.options.pipeline_options.StandardOptions).runner = args.runner
+
+    with beam.Pipeline(options=pipeline_options) as p:
+        # Create PCollections keyed by block (block key reduces comparisons)
+        accounts_pc = p | "CreateAccounts" >> beam.Create(accounts_list)
+        facilities_pc = p | "CreateFacilities" >> beam.Create(enriched_facilities)
+
+        accounts_kv = accounts_pc | "AccountToKV" >> beam.ParDo(ToKVByBlock(account_side=True))
+        facilities_kv = facilities_pc | "FacilityToKV" >> beam.ParDo(ToKVByBlock(account_side=False))
+
+        # CoGroupByKey to get candidates per block
+        grouped = ({'accounts': accounts_kv, 'facilities': facilities_kv}
+                   | "GroupByBlock" >> beam.CoGroupByKey())
+
+        matches = grouped | "ScoreAndPick" >> beam.ParDo(ScoreAndPick())
+
+        # Write to CSV (header + rows)
+        def dict_to_csv(row):
+            # fixed column order
+            cols = ["TRANSACTION_ID","ACCOUNT_NUMBER","UNIQUE_ACCOUNT_IDENTIFIER","SORT_CODE","BOLT_PRODUCTID","ACCOUNT_LIMIT",
+                    "MATCHED_FACILITY_INSTANCE_ID","MATCHED_FACILITY_ID","MATCH_SCORE","MATCH_CATEGORY","MATCH_REASON","FEATURE_SCORES"]
+            return ",".join('"' + (str(row.get(c,""))).replace('"','""') + '"' for c in cols)
+
+        header = ",".join(["TRANSACTION_ID","ACCOUNT_NUMBER","UNIQUE_ACCOUNT_IDENTIFIER","SORT_CODE","BOLT_PRODUCTID","ACCOUNT_LIMIT",
+                           "MATCHED_FACILITY_INSTANCE_ID","MATCHED_FACILITY_ID","MATCH_SCORE","MATCH_CATEGORY","MATCH_REASON","FEATURE_SCORES"])
+
+        # Write results with header
+        (
+            matches
+            | "ToCSV" >> beam.Map(dict_to_csv)
+            | "AddHeaderKey" >> beam.transforms.util.WithKeys(lambda _: 0)
+            | "GroupHeader" >> beam.GroupByKey()
+            | "PrependHeader" >> beam.FlatMap(lambda kv: [header] + list(kv[1]))
+            | "Write" >> beam.io.WriteToText(args.output_path, file_name_suffix=".csv", shard_name_template="-SS-of-NN")
+        )
+
+if __name__ == "__main__":
+    run()
